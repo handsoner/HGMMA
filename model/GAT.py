@@ -43,7 +43,18 @@ class GraphAttentionLayer(MessagePassing):
         x_r = x_l = self.feat_lin(x).view(-1, self.heads, self.out_features)
 
         # calculate normal transformer components Q, K, V
-        output = self.propagate(edge_index=edge_idx, x=(x_l, x_r), size=size)
+        # The existing layer uses plain mean aggregation (no message override).
+        # Sparse multiplication avoids materializing E x heads x features.
+        if edge_idx.layout == torch.sparse_coo:
+            aggregation = edge_idx
+        else:
+            src, dst = edge_idx
+            degree = torch.bincount(dst, minlength=x.shape[0]).clamp(min=1)
+            aggregation = torch.sparse_coo_tensor(
+                torch.stack((dst, src)), 1.0 / degree[dst].to(x.dtype),
+                (x.shape[0], x.shape[0]), device=x.device).coalesce()
+        output = torch.sparse.mm(aggregation, x_l.reshape(x.shape[0], -1))
+        output = output.view(x.shape[0], self.heads, self.out_features)
 
         if self.proj_r is not None:
             output = (output.transpose(0, 1) + self.proj_r(x)).transpose(1, 0)
