@@ -16,7 +16,6 @@ Extensive experiments demonstrate that HGMMA achieves strong predictive performa
 | Number of GPUs   | 1                                                                                                     |
 | VRAM             | 24 GB GDDR6X                                                                                          |
 | GPU Architecture | NVIDIA Ampere (Compute Capability 8.6)                                                                |
-| CPU              | x86-64 multi-core processor (specific model not recorded)                                             |
 | RAM              | Specific capacity not recorded; recommended minimum: 32 GB                                            |
 | Storage          | Recommended minimum: 20 GB of available space for data, model weights, intermediate results, and logs |
 
@@ -26,7 +25,7 @@ Both training and inference were performed using a single GPU; no multi-GPU or d
 
 ## 3. Software Environment
 
-The original experiments were conducted in a 64-bit Microsoft Windows environment, with Conda used to manage the Python environment. The key software packages and versions are listed below.
+The original experiments were conducted in a Ubantu environment, with Conda used to manage the Python environment. The key software packages and versions are listed below.
 
 | Software or Dependency |                                                  Version | Primary Purpose                                            |
 | :--------------------- | -------------------------------------------------------: | :--------------------------------------------------------- |
