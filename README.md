@@ -1,5 +1,5 @@
 # HGMMA
-## Abstract
+## 1. Abstract
 Microbe–metabolite associations provide critical insights into microbial functions, host metabolic regulation, and disease mechanisms. However, the experimental identification of such associations remains costly, time-consuming, and difficult to scale, while computational models specifically designed for microbe–metabolite association prediction remain relatively limited. To address these challenges, we developed HGMMA, a multi-view self-expression-enhanced heterogeneous graph contrastive learning framework for predicting potential microbe–metabolite associations.
 
 HGMMA integrates multi-source similarity information with Graph Transformer-based representation learning to capture high-order structural dependencies. Furthermore, a connection-strength-guided view construction strategy and a multi-view self-expression mechanism are introduced to enhance graph homophily and mitigate false-negative interference in heterogeneous graph contrastive learning.
