@@ -1,20 +1,112 @@
-import os
-import timeit
 import argparse
+import hashlib
+import json
+import random
+import time
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import torch.optim as optim
 import torch
-import torch.nn as nn
-import torch.nn.functional as fn
-from data_preprocess import *
+import torch.nn.functional as F
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import average_precision_score, auc, precision_recall_curve
+from data_preprocess import build_similarity_graphs, construct_adj_mat
+from fold_features import load_dataset, make_fold_features
 from model.AMNTDDA import AMNTDDA
-from metric import *
+from metric import get_metric
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-if __name__ == '__main__':
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
+
+def sample_pairs(adjacency, negative_rate, seed):
+    # Preserve the previous row-major sampling order and random sequence.
+    positive = np.argwhere(adjacency == 1).tolist()
+    negative = np.argwhere(adjacency == 0).tolist()
+    rng = random.Random(seed)
+    rng.shuffle(positive)
+    rng.shuffle(negative)
+    negative = negative[:int(negative_rate * len(positive))]
+    return (np.asarray(positive + negative, dtype=int),
+            np.asarray([1] * len(positive) + [0] * len(negative), dtype=int))
+
+
+def train_epoch(model, optimizer, graphs, het, edges, adj, strength,
+                pairs, labels, batch_size, loss_rate):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+    auxiliary, meta, micro = model.encode(*graphs, het, edges, adj, strength)
+    # Backpropagate decoder chunks into small detached node embeddings first.
+    # Then propagate their accumulated gradients through the encoder once.
+    meta_leaf = meta.detach().requires_grad_(True)
+    micro_leaf = micro.detach().requires_grad_(True)
+    ce_total = 0.0
+    for start in range(0, len(pairs), batch_size):
+        stop = start + batch_size
+        score = model.decode(meta_leaf, micro_leaf, pairs[start:stop])
+        ce = F.cross_entropy(score, labels[start:stop], reduction='sum') / len(pairs)
+        ((1 - loss_rate) * ce).backward()
+        ce_total += ce.detach().item()
+    torch.autograd.backward([auxiliary * loss_rate, meta, micro],
+                            [None, meta_leaf.grad, micro_leaf.grad])
+    optimizer.step()
+    return ce_total, auxiliary.detach().item()
+
+
+@torch.no_grad()
+def evaluate(model, graphs, het, edges, adj, strength, pairs, batch_size):
+    model.eval()
+    _, meta, micro = model.encode(*graphs, het, edges, adj, strength)
+    return np.concatenate([
+        model.decode(meta, micro, pairs[start:start + batch_size]).softmax(-1)[:, 1].cpu().numpy()
+        for start in range(0, len(pairs), batch_size)
+    ])
+
+
+def save_epoch_aupr_plot(output, records):
+    """Save per-fold and mean AUPRC learning curves after a diagnostic replay."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    table = pd.DataFrame(records)
+    table.to_csv(output / 'epoch_aupr.csv', index=False)
+    summary = table.groupby('epoch')[['AUPR_trapezoid', 'AP']].agg(['mean', 'std']).fillna(0)
+    summary.columns = ['_'.join(column) for column in summary.columns]
+    summary.to_csv(output / 'epoch_aupr_summary.csv')
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    for fold, group in table.groupby('fold'):
+        ax.plot(group['epoch'], group['AUPR_trapezoid'], alpha=0.35, linewidth=1,
+                label=f'Fold {fold + 1}')
+    epoch = summary.index.to_numpy()
+    mean = summary['AUPR_trapezoid_mean'].to_numpy()
+    std = summary['AUPR_trapezoid_std'].to_numpy()
+    ax.plot(epoch, mean, color='black', linewidth=2.2, label='Five-fold mean')
+    ax.fill_between(epoch, mean - std, mean + std, color='black', alpha=0.12,
+                    label='Mean +/- fold SD')
+    ax.axhline(0.5, color='gray', linestyle=':', linewidth=1, label='Balanced random baseline')
+    ax.set(xlabel='Epoch', ylabel='AUPRC (trapezoidal)',
+           title='Test AUPRC by epoch (diagnostic only)')
+    ax.set_xlim(1, max(2, int(epoch.max())))
+    ax.grid(alpha=0.2)
+    ax.legend(ncol=2, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(output / 'epoch_aupr.png', dpi=300)
+    fig.savefig(output / 'epoch_aupr.pdf')
+    plt.close(fig)
+
+
+
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--k_fold', type=int, default=5, help='k-fold cross validation')
     parser.add_argument('--epochs', type=int, default=200, help='number of epochs to train')
@@ -23,9 +115,7 @@ if __name__ == '__main__':
     parser.add_argument('--random_seed', type=int, default=1234, help='random seed')
     parser.add_argument('--neighbor', type=int, default=20, help='neighbor')
     parser.add_argument('--negative_rate', type=float, default=1.0, help='negative_rate')
-    # parser.add_argument('--dataset', default='metadis_meanfusion', help='dataset') #
-    # parser.add_argument('--dataset', default='metadis', help='dataset')
-    parser.add_argument('--dataset', default='metadis_external', help='dataset') #外部验证
+    parser.add_argument('--dataset', default='metadis_meanfusion', help='dataset')
     parser.add_argument('--dropout', default='0.40', type=float, help='dropout')
     parser.add_argument('--gt_layer', default='4', type=int, help='graph transformer layer')
     parser.add_argument('--gt_head', default='1', type=int, help='graph transformer head')
@@ -57,241 +147,119 @@ if __name__ == '__main__':
     parser.add_argument('--loss_rate', default='0.5', type=float,
                         help='loss rate of unsupervised learning and training')
 
+    parser.add_argument('--feature_mode', choices=['meanfusion', 'gip', 'independent-gip'], default='meanfusion',
+                        help='Fold-local three-view arithmetic fusion (default); optional ablation modes')
+    parser.add_argument('--batch_size', type=int, default=4096)
+    parser.add_argument('--output', type=Path, default=Path('results/leakage_fixed'))
+    parser.add_argument('--torch_threads', type=int, default=4)
+    parser.add_argument('--track_epoch_aupr', action='store_true',
+                        help='evaluate test AUPRC after every epoch and draw a diagnostic learning curve')
     args = parser.parse_args()
-    args.data_dir = 'data/' + args.dataset + '/'
-    args.result_dir = 'Result/' + args.dataset + '/AMNTDDA/'
-
-    data = get_data(args)
-    args.meta_number = data['meta_number']
-    args.micro_number = data['micro_number']
-    args.drug_number = args.meta_number
-    args.disease_number = args.micro_number
-    # args.protein_number = data['protein_number']
-
-    data = data_processing(data, args)
-    data = k_fold(data, args)
-
-    meta_meta_graph, micro_micro_graph, data = build_similarity_graphs(data, args)
-    het_mat = np.vstack((np.hstack((data['meta_sim'], data['adj'])), np.hstack((data['adj'].T, data['micro_sim']))))
-    het_mat = torch.tensor(het_mat, dtype=torch.float32, device=device)
-
-    adj_mat = construct_adj_mat(data['adj'])
-    edge_idx = torch.tensor(np.where(adj_mat == 1), dtype=torch.long, device=device)
-    Heter_adj_edge_index = get_edge_index_torch(adj_mat)
-
-    meta_meta_graph = meta_meta_graph.to(device)
-    micro_micro_graph = micro_micro_graph.to(device)
-
-    train_data = {}
-    Heter_adj = het_mat.float()
-    train_data['Adj'] = {'data': Heter_adj, 'edge_index': Heter_adj_edge_index}
-    train_data['Y_train'] = torch.DoubleTensor(data['adj'])
-    train_data['feature'] = torch.FloatTensor(adj_mat)
-
-    # drug_feature = torch.FloatTensor(data['drugfeature']).to(device)
-    # disease_feature = torch.FloatTensor(data['diseasefeature']).to(device)
-    # protein_feature = torch.FloatTensor(data['proteinfeature']).to(device)
-    all_sample = torch.tensor(data['all_meta_micro']).long()
-
-    start = timeit.default_timer()
-
-    cross_entropy = nn.CrossEntropyLoss()
-
-    Metric = ('Epoch\t\tTime\t\tAUC\t\tAUPR\t\tAccuracy\t\tPrecision\t\tRecall\t\tF1-score\t\tMcc')
-    AUCs, AUPRs, accuracys, precisions, recalls, f1s, mccs, spes = [], [], [], [], [], [], [], []
-    f1_score, accuracy2, recall2, precision2 = [], [], [], []
-    print('Dataset:', args.dataset)
-
-    truth = []
-    probability = []
-    # 存储每个fold的结果
-    fold_results = []
-
-    for i in range(args.k_fold):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        print('fold:', i)
-        print(Metric)
-
-        model = AMNTDDA(args)
-        if i==0:
-            print(model)
-        model = model.to(device)
-        optimizer = optim.Adam(model.parameters(), weight_decay=args.weight_decay, lr=args.lr)
-
-        best_auc, best_aupr, best_accuracy, best_precision, best_recall, best_f1, best_mcc, best_spe = 0, 0, 0, 0, 0, 0, 0, 0
-        best_labels, best_scores = [], []
-        meta_micro_train = torch.LongTensor(data['meta_micro_train'][i]).to(device)
-        Y_train = torch.LongTensor(data['Y_train'][i]).to(device)
-        meta_micro_test = torch.LongTensor(data['meta_micro_test'][i]).to(device)
-        Y_test = data['Y_test'][i].flatten()
-
-        # meta_micro_protein_graph, data = build_meta_micro_protein_graph(data, data['meta_micro_train'][i], args)
-        # meta_micro_protein_graph = meta_micro_protein_graph.to(device)
-
-        meta_micro_graph, data = build_meta_micro_graph(data, data['meta_micro_train'][i], args)
-        meta_micro_graph = meta_micro_graph.to(device)
-
+    if args.epochs < 1 or args.batch_size < 1 or args.negative_rate <= 0:
+        parser.error('epochs, batch_size and negative_rate must be positive')
+    args.output.mkdir(parents=True, exist_ok=True)
+    if (args.output / 'config.json').exists():
+        parser.error('Output directory already contains a run; choose a new --output')
+    torch.set_num_threads(args.torch_threads)
+    seed_everything(args.random_seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    data = load_dataset(Path('data') / args.dataset, args.feature_mode)
+    args.meta_number, args.micro_number = data['adj'].shape
+    args.drug_number, args.disease_number = args.meta_number, args.micro_number
+    config = vars(args).copy()
+    config.update(device=str(device), torch_version=torch.__version__,
+                  gpu=torch.cuda.get_device_name(0) if device.type == 'cuda' else None,
+                  evaluation='fixed final epoch; no test-based model selection',
+                  entropy_included=args.feature_mode == 'meanfusion')
+    source_paths = [Path('train.py'), Path('fold_features.py'), Path('data_preprocess.py'),
+                    Path('metric.py'), *sorted(Path('model').glob('*.py'))]
+    config['source_sha256'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in source_paths}
+    data_paths = [Path('data') / args.dataset / 'adj.csv',
+                  Path('data') / args.dataset / 'MetaMIcroAssociationNumber.csv']
+    if args.feature_mode in ('meanfusion', 'independent-gip'):
+        data_paths += [Path('data/S_meta_structure_work.csv'), Path('data/microbe_taxonomy_similarity.csv')]
+    config['input_sha256'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in data_paths}
+    (args.output / 'config.json').write_text(json.dumps(config, default=str, indent=2), encoding='utf-8')
+    print(json.dumps(config, default=str), flush=True)
+    pairs, labels = sample_pairs(data['adj'], args.negative_rate, args.random_seed)
+    rows = []
+    epoch_metric_rows = []
+    start_time = time.perf_counter()
+    for fold, (train_idx, test_idx) in enumerate(StratifiedKFold(args.k_fold, shuffle=False).split(pairs, labels)):
+        seed_everything(args.random_seed + fold)
+        folder = args.output / f'fold_{fold}'
+        folder.mkdir()
+        np.savez_compressed(folder / 'split.npz', train_pairs=pairs[train_idx], train_labels=labels[train_idx],
+                            test_pairs=pairs[test_idx], test_labels=labels[test_idx])
+        local = make_fold_features(data['adj'].shape, pairs[train_idx], labels[train_idx],
+                                   pairs[test_idx], args.feature_mode, data)
+        adjacency = local['adj']
+        audit = {'fold': fold, 'train_positive': int(adjacency.sum()),
+                 'test_positive': int(labels[test_idx].sum()),
+                 'test_edges_in_training_adjacency': int(adjacency[tuple(pairs[test_idx].T)].sum()),
+                 'adjacency_sha256': hashlib.sha256(adjacency.tobytes()).hexdigest()}
+        assert audit['test_edges_in_training_adjacency'] == 0
+        (folder / 'mask_audit.json').write_text(json.dumps(audit, indent=2), encoding='utf-8')
+        np.save(folder / 'train_adj.npy', adjacency)
+        np.savez_compressed(folder / 'similarities.npz', meta=local['meta_sim'], micro=local['micro_sim'])
+        meta_graph, micro_graph, _ = build_similarity_graphs(local, args)
+        graphs = (meta_graph.to(device), micro_graph.to(device))
+        het = torch.tensor(np.block([[local['meta_sim'], adjacency],
+                                     [adjacency.T, local['micro_sim']]]), device=device)
+        adj = torch.tensor(construct_adj_mat(adjacency), dtype=torch.float32, device=device)
+        src, dst = torch.where(adj == 1)
+        degree = torch.bincount(dst, minlength=adj.shape[0]).clamp(min=1)
+        edges = torch.sparse_coo_tensor(torch.stack((dst, src)), 1.0 / degree[dst].float(),
+                                        adj.shape, device=device).coalesce()
+        model = AMNTDDA(args).to(device)
+        with torch.no_grad():
+            strength = model.hgms_block.build_connection_strength(adj)
+        train_pairs = torch.as_tensor(pairs[train_idx], device=device)
+        train_labels = torch.as_tensor(labels[train_idx], dtype=torch.long, device=device)
+        test_pairs = torch.as_tensor(pairs[test_idx], device=device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        history = []
         for epoch in range(args.epochs):
-            model.train()
-            loss_h, train_score = model(meta_meta_graph, micro_micro_graph, het_mat, edge_idx, adj_mat,
-                                        meta_micro_train)
-            train_loss = cross_entropy(train_score, torch.flatten(Y_train))
-            loss_all = args.loss_rate * loss_h + (1 - args.loss_rate) * train_loss
-            # loss_all = train_loss
-            optimizer.zero_grad()
-            loss_all.backward()
-            optimizer.step()
-
-            # loss_h = loss_h.detach().cpu().numpy()
-            # train_loss = train_loss.detach().cpu().numpy()
-
-            with torch.no_grad():
-                model.eval()
-                _, test_score = model(meta_meta_graph, micro_micro_graph, het_mat, edge_idx, adj_mat,
-                                      meta_micro_test)
-
-            test_prob = fn.softmax(test_score, dim=-1)
-            test_score = torch.argmax(test_score, dim=-1)
-            
-            test_prob = test_prob[:, 1]
-            test_prob = test_prob.cpu().numpy()
-
-            test_score = test_score.cpu().numpy()
-
-            AUC, AUPR, accuracy, precision, recall, f1, mcc, spe = get_metric(Y_test, test_score, test_prob)
-            # f1_score, accuracy2, recall2, precision2 = get_metrics2(Y_test, test_score)
-
-            end = timeit.default_timer()
-            time = end - start
-            show = [epoch + 1, round(time, 2), round(AUC, 5), round(AUPR, 5), round(accuracy, 5),
-                    round(precision, 5), round(recall, 5), round(f1, 5), round(mcc, 5), round(spe, 5)]
-            print('\t\t'.join(map(str, show)))
-            if AUC > best_auc:
-                best_epoch = epoch + 1
-                best_auc = AUC
-                best_aupr, best_accuracy, best_precision, best_recall, best_f1, best_mcc, best_spe = AUPR, accuracy, precision, recall, f1, mcc, spe
-                best_labels = Y_test
-                best_scores = test_prob
-
-                torch.save(model.state_dict(),"./case_study/train_model.pth")   #保存模型，按照这个逻辑只保存最后的一折的训练模型
-
-                print('AUC improved at epoch ', best_epoch, ';\tbest_auc:', best_auc)
-
-        # truth.extend(best_labels)
-        # probability.extend(best_scores)
-
-        # 保存每个fold的结果
-        fold_results.append((best_labels, best_scores))
-
-        AUCs.append(best_auc)
-        AUPRs.append(best_aupr)
-        accuracys.append(best_accuracy)
-        precisions.append(best_precision)
-        recalls.append(best_recall)
-        f1s.append(best_f1)
-        mccs.append(best_mcc)
-        spes.append(best_spe)
-        del model, optimizer, meta_micro_train, Y_train, meta_micro_test, meta_micro_graph
-        if torch.cuda.is_available():
+            epoch_start = time.perf_counter()
+            ce, auxiliary = train_epoch(model, optimizer, graphs, het, edges, adj, strength,
+                                         train_pairs, train_labels, args.batch_size, args.loss_rate)
+            record = {'epoch': epoch + 1, 'cross_entropy': ce, 'auxiliary_loss': auxiliary,
+                      'seconds': time.perf_counter() - epoch_start}
+            if args.track_epoch_aupr:
+                epoch_probabilities = evaluate(model, graphs, het, edges, adj, strength,
+                                               test_pairs, args.batch_size)
+                precision, recall, _ = precision_recall_curve(labels[test_idx], epoch_probabilities)
+                record.update(AUPR_trapezoid=auc(recall, precision),
+                              AP=average_precision_score(labels[test_idx], epoch_probabilities))
+                epoch_metric_rows.append({'fold': fold, **record})
+                pd.DataFrame(epoch_metric_rows).to_csv(args.output / 'epoch_aupr.csv', index=False)
+            history.append(record)
+            print(f'fold={fold} ' + json.dumps(record), flush=True)
+            pd.DataFrame(history).to_csv(folder / 'training.csv', index=False)
+        probabilities = evaluate(model, graphs, het, edges, adj, strength, test_pairs, args.batch_size)
+        truth = labels[test_idx]
+        metrics = get_metric(truth, (probabilities > 0.5).astype(int), probabilities)
+        names = ['AUC', 'AUPR_trapezoid', 'Accuracy', 'Precision', 'Recall', 'F1', 'MCC', 'Specificity']
+        row = {'fold': fold, **dict(zip(names, metrics)), 'AP': average_precision_score(truth, probabilities)}
+        rows.append(row)
+        pd.DataFrame(rows).to_csv(args.output / 'fold_metrics.csv', index=False)
+        np.savez_compressed(folder / 'predictions.npz', pairs=pairs[test_idx], labels=truth, probabilities=probabilities)
+        torch.save(model.state_dict(), folder / 'final_model.pth')
+        print('FINAL ' + json.dumps(row), flush=True)
+        del model, optimizer, graphs, het, edges, adj, strength, train_pairs, train_labels, test_pairs
+        if device.type == 'cuda':
             torch.cuda.empty_cache()
-
-    # # 保存所有fold的结果
-    root_path = os.path.join('results', 'GHTMDA_108')
-    os.makedirs(root_path, exist_ok=True)
-    # 绘制ROC曲线、AUPR曲线
-
-    # np.save(os.path.join(root_path, 'fold_results.npy'), fold_results)
-    fold_results_array = np.array(fold_results, dtype=object)
-    np.save(os.path.join(root_path, 'fold_results.npy'), fold_results_array)
-
-    # np.save('result/GHTMDA/truth.npy', np.array(truth))
-    # np.save('result/GHTMDA/pred.npy', np.array(probability))
-
-    print('AUC:', AUCs)
-    AUC_mean = np.mean(AUCs)
-    AUC_std = np.std(AUCs)
-    print('Mean AUC:', AUC_mean, '(', AUC_std, ')')
-
-    print('AUPR:', AUPRs)
-    AUPR_mean = np.mean(AUPRs)
-    AUPR_std = np.std(AUPRs)
-    print('Mean AUPR:', AUPR_mean, '(', AUPR_std, ')')
-
-    print('accuracy:', accuracys)
-    accuracy_mean = np.mean(accuracys)
-    accuracy_std = np.std(AUPRs)
-    print('Mean accuracy:', accuracy_mean, '(', accuracy_std, ')')
-
-    print('precision:', precisions)
-    precision_mean = np.mean(precisions)
-    precision_std = np.std(precisions)
-    print('Mean precision:', precision_mean, '(', precision_std, ')')
-
-    print('recall:', recalls)
-    recall_mean = np.mean(recalls)
-    recall_std = np.std(recalls)
-    print('Mean recall:', recall_mean, '(', recall_std, ')')
-
-    print('f1:', f1s)
-    f1_mean = np.mean(f1s)
-    f1_std = np.std(f1s)
-    print('Mean f1:', f1_mean, '(', f1_std, ')')
-
-    print('mcc:', mccs)
-    mcc_mean = np.mean(mccs)
-    mcc_std = np.std(mccs)
-    print('Mean mcc:', mcc_mean, '(', mcc_std, ')')
-
-    print('mcc:', spes)
-    spe_mean = np.mean(spes)
-    spe_std = np.std(spes)
-    print('Mean spe:', spe_mean, '(', spe_std, ')')
-
-    plot_roc_curves(root_path, fold_results)
-    plot_pr_curves(root_path, fold_results)
-    plot_combined_curves(root_path, fold_results)
+    table = pd.DataFrame(rows).drop(columns='fold')
+    summary = {'mean': table.mean().to_dict(), 'std_population': table.std(ddof=0).to_dict(),
+               'elapsed_seconds': time.perf_counter() - start_time, 'folds': len(rows),
+               'epochs_per_fold': args.epochs, 'feature_mode': args.feature_mode,
+               'entropy_included': args.feature_mode == 'meanfusion'}
+    (args.output / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    if args.track_epoch_aupr:
+        save_epoch_aupr_plot(args.output, epoch_metric_rows)
+        print(f'EPOCH_AUPR_PLOT {args.output / "epoch_aupr.png"}', flush=True)
+    print('SUMMARY ' + json.dumps(summary), flush=True)
 
 
-    # 创建一个函数来格式化平均值和标准差
-    def format_mean_std(mean, std):
-        return f"{round(mean, 4):.4f} ({round(std, 4):.4f})"
-
-
-    # 创建一个字典来存储所有的结果
-    results = {
-        'Metric': ['AUC', 'AUPR', 'Accuracy', 'Precision', 'Recall', 'F1', 'MCC', 'Specificity'],
-        'Values': [AUCs, AUPRs, accuracys, precisions, recalls, f1s, mccs, spes],
-        'Mean (Std)': [
-            format_mean_std(AUC_mean, AUC_std),
-            format_mean_std(AUPR_mean, AUPR_std),
-            format_mean_std(accuracy_mean, accuracy_std),
-            format_mean_std(precision_mean, precision_std),
-            format_mean_std(recall_mean, recall_std),
-            format_mean_std(f1_mean, f1_std),
-            format_mean_std(mcc_mean, mcc_std),
-            format_mean_std(spe_mean, spe_std)
-        ]
-    }
-
-    # 创建DataFrame
-    df = pd.DataFrame(results)
-
-    # 将DataFrame保存为Excel文件
-    # 保存性能指标到Excel文件
-    performance_metrics_file = os.path.join(root_path, 'performance_metrics.xlsx')
-    df.to_excel(performance_metrics_file, index=False)
-
-    # 如果您想保存单独的sheet来显示每次交叉验证的结果
-    with pd.ExcelWriter(os.path.join(root_path, 'detailed_results.xlsx')) as writer:
-        df.to_excel(writer, sheet_name='Summary', index=False)
-
-        for i, values in enumerate(zip(AUCs, AUPRs, accuracys, precisions, recalls, f1s, mccs, spes)):
-            fold_df = pd.DataFrame({
-                'Metric': ['AUC', 'AUPR', 'Accuracy', 'Precision', 'Recall', 'F1', 'MCC', 'Specificity'],
-                'Value': [f"{round(v, 4):.4f}" for v in values]  # 格式化每个值为8位小数
-            })
-            fold_df.to_excel(writer, sheet_name=f'Fold_{i + 1}', index=False)
-
-    print("结果已保存到Excel文件中，平均值显示为8位小数。")
+if __name__ == '__main__':
+    main()
