@@ -23,6 +23,7 @@ Both training and inference were performed using a single GPU; no multi-GPU or d
 ## 3. Software Environment
 
 The original experiments were conducted in a 64-bit Microsoft Windows environment, using Conda to manage the Python environment. Key software versions are listed below. | Software or Dependency | Version | Primary Purpose |
+
 | :--- | ---: | :--- |
 | Operating System | Microsoft Windows 64-bit (specific version not recorded) | Experiment execution platform |
 | Python | 3.9.16 | Program execution environment |
