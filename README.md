@@ -30,7 +30,7 @@ The original experiments were conducted in a 64-bit Microsoft Windows environmen
 
 | Software or Dependency |                                                  Version | Primary Purpose                                            |
 | :--------------------- | -------------------------------------------------------: | :--------------------------------------------------------- |
-| Operating System       | Microsoft Windows 64-bit (specific version not recorded) | Experiment execution platform                              |
+| Operating System       |                                                   Ubantu | Experiment execution platform                              |
 | Python                 |                                                   3.9.16 | Program execution environment                              |
 | PyTorch                |                                              2.0.1+cu118 | Model construction, training, and inference                |
 | CUDA Runtime           |                                                     11.8 | GPU acceleration                                           |
