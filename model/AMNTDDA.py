@@ -71,6 +71,12 @@ class AMNTDDA(nn.Module):
 
     def forward(self, meta_meta_graph, micro_micro_graph, het_mat, edge_idx, adj_mat,
                 sample):
+        loss, meta, micro = self.encode(meta_meta_graph, micro_micro_graph,
+                                        het_mat, edge_idx, adj_mat)
+        return loss, self.decode(meta, micro, sample)
+
+    def encode(self, meta_meta_graph, micro_micro_graph, het_mat, edge_idx, adj_mat,
+               connection_strength=None):
         # 1. Homogeneous similarity graph representations
         # 这是同构图部分
         meta_sim = self.gt_meta(meta_meta_graph)   #直接进入Transformer提前单图的特征，代谢物
@@ -88,7 +94,7 @@ class AMNTDDA(nn.Module):
         z_gat = gat_embd
 
         # 3. HGMS-style replacement for HERO
-        emb_het, emb_hom, loss_hgms = self.hgms_block(z_proj, z_gat, adj_mat)
+        emb_het, emb_hom, loss_hgms = self.hgms_block(z_proj, z_gat, adj_mat, connection_strength)
 
 
         # 4. HGMS loss replaces HERO consistency/specificity loss
@@ -100,7 +106,8 @@ class AMNTDDA(nn.Module):
         micro_x = h_concat[self.args.meta_number:]  #拿走剩下的微生物特征
 
         # 6. Replace vanilla contrastive_loss with HGMS weighted contrastive loss
-        S_all = self.hgms_block.build_connection_strength(adj_mat)
+        S_all = (connection_strength if connection_strength is not None
+                 else self.hgms_block.build_connection_strength(adj_mat))
         S_meta = S_all[:self.args.meta_number, :self.args.meta_number]
         S_micro = S_all[self.args.meta_number:, self.args.meta_number:]
 
@@ -114,12 +121,10 @@ class AMNTDDA(nn.Module):
         micro = torch.cat((micro_sim, micro_x), dim=1)
         # meta = meta_sim #消融异构图
         # micro = micro_sim   #消融异构图
-        meta_micro_embedding = torch.mul(meta[sample[:, 0]], micro[sample[:, 1]])
-        # meta_micro_embedding = torch.cat((meta[sample[:, 0]], micro[sample[:, 1]], torch.mul(meta[sample[:, 0]], micro[sample[:, 1]]), torch.abs(meta[sample[:, 0]] - micro[sample[:, 1]])), dim=1) #自己的改动，1. 拼接 + 差异 + 乘积联合建模
+        return loss, meta, micro
 
-        output = self.mlp(meta_micro_embedding)
-        # loss = torch.tensor(0.0, device=output.device)  #消融所有对比损失
-        return loss, output
+    def decode(self, meta, micro, sample):
+        return self.mlp(meta[sample[:, 0]] * micro[sample[:, 1]])
 
 #新引入的异构图算法HGMS
 class HGMSBlock(nn.Module):
@@ -276,8 +281,9 @@ class HGMSBlock(nn.Module):
 
         return loss
 
-    def forward(self, z_proj, z_gat, adj_mat):
-        S = self.build_connection_strength(adj_mat)
+    def forward(self, z_proj, z_gat, adj_mat, connection_strength=None):
+        S = (connection_strength if connection_strength is not None
+             else self.build_connection_strength(adj_mat))
 
         # View 1: connection-strength enhanced heterogeneous representation
         z_cs = torch.matmul(S, z_gat)
